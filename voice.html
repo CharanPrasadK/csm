@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CSM Voice Chat</title>
+    <style>
+        body {
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            height: 100vh; margin: 0; background: #222; color: white; font-family: sans-serif;
+        }
+        #micBtn {
+            width: 150px; height: 150px; border-radius: 50%; border: none;
+            background: #444; color: white; font-size: 1.2rem; cursor: pointer;
+            box-shadow: 0 0 20px rgba(0,0,0,0.5); transition: all 0.2s;
+            display: flex; align-items: center; justify-content: center; flex-direction: column;
+        }
+        #micBtn.recording { background: #d63333; box-shadow: 0 0 30px #d63333; transform: scale(1.1); }
+        #micBtn.processing { background: #007bff; animation: pulse 1.5s infinite; }
+        #status { margin-top: 20px; color: #aaa; height: 20px; }
+        
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(0, 123, 255, 0.7); }
+            70% { box-shadow: 0 0 0 20px rgba(0, 123, 255, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(0, 123, 255, 0); }
+        }
+    </style>
+</head>
+<body>
+
+    <button id="micBtn" onmousedown="startRecording()" onmouseup="stopRecording()" ontouchstart="startRecording()" ontouchend="stopRecording()">
+        <span>Hold to Talk</span>
+    </button>
+    <div id="status">Ready</div>
+
+    <script>
+        let mediaRecorder;
+        let audioChunks = [];
+        const btn = document.getElementById('micBtn');
+        const status = document.getElementById('status');
+
+        async function initAudio() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream);
+
+                mediaRecorder.ondataavailable = event => {
+                    audioChunks.push(event.data);
+                };
+
+                mediaRecorder.onstop = sendAudio;
+            } catch (err) {
+                alert("Microphone access denied!");
+            }
+        }
+
+        function startRecording() {
+            if (!mediaRecorder) return;
+            audioChunks = [];
+            mediaRecorder.start();
+            btn.classList.add('recording');
+            btn.innerText = "Listening...";
+            status.innerText = "Recording...";
+        }
+
+        function stopRecording() {
+            if (!mediaRecorder || mediaRecorder.state === "inactive") return;
+            mediaRecorder.stop();
+            btn.classList.remove('recording');
+            btn.classList.add('processing');
+            btn.innerText = "Thinking...";
+            status.innerText = "Processing & Generating...";
+        }
+
+        async function sendAudio() {
+            const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+            const formData = new FormData();
+            formData.append("file", audioBlob, "input.wav");
+
+            try {
+                const response = await fetch('/talk', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) throw new Error("Server Error");
+
+                const blob = await response.blob();
+                const audioUrl = URL.createObjectURL(blob);
+                const audio = new Audio(audioUrl);
+                
+                status.innerText = "Speaking...";
+                btn.classList.remove('processing');
+                btn.innerText = "Hold to Talk";
+                
+                audio.play();
+                audio.onended = () => { status.innerText = "Ready"; };
+
+            } catch (err) {
+                console.error(err);
+                status.innerText = "Error occurred";
+                btn.classList.remove('processing');
+                btn.innerText = "Hold to Talk";
+            }
+        }
+
+        initAudio();
+    </script>
+</body>
+</html>
