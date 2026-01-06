@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Live AI</title>
+    <style>
+        body {
+            background-color: #000; color: white; font-family: -apple-system, sans-serif;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            height: 100vh; margin: 0; user-select: none;
+        }
+        
+        .status { font-size: 1.5rem; margin-bottom: 20px; color: #888; font-weight: 500; min-height: 30px;}
+        
+        /* The Big PTT Button */
+        #mic-btn {
+            width: 200px; height: 200px; border-radius: 50%;
+            background: #222; border: 4px solid #444;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 4rem; cursor: pointer; transition: all 0.1s;
+            box-shadow: 0 10px 20px rgba(0,0,0,0.5);
+            -webkit-tap-highlight-color: transparent;
+        }
+        
+        /* States */
+        body.recording #mic-btn { background: #ff3b30; border-color: #ff3b30; transform: scale(0.95); box-shadow: 0 0 30px #ff3b30; }
+        body.recording .status { color: #ff3b30; }
+        
+        body.speaking #mic-btn { border-color: #0a84ff; box-shadow: 0 0 30px #0a84ff; animation: pulse 1s infinite; }
+        body.speaking .status { color: #0a84ff; }
+
+        .hint { margin-top: 30px; color: #555; font-size: 0.9rem; }
+
+        @keyframes pulse { 0% { transform: scale(1); } 50% { transform: scale(1.05); } 100% { transform: scale(1); } }
+    </style>
+</head>
+<body>
+
+    <div class="status" id="status">Connecting...</div>
+    
+    <div id="mic-btn">🎙️</div>
+
+    <div class="hint">Hold <b>Space</b> or <b>Touch</b> to Talk</div>
+
+<script>
+    let ws;
+    let mediaRecorder;
+    let chunks = [];
+    let isRecording = false;
+    
+    // Audio Playback Queue
+    let audioQueue = [];
+    let isPlaying = false;
+    let currentAudio = new Audio();
+
+    // 1. Initialize System
+    async function init() {
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            mediaRecorder = new MediaRecorder(stream);
+            mediaRecorder.ondataavailable = e => chunks.push(e.data);
+            mediaRecorder.onstop = sendAudio;
+            
+            connectWS();
+        } catch(e) {
+            document.getElementById("status").innerText = "Mic Error";
+        }
+    }
+
+    function connectWS() {
+        ws = new WebSocket("ws://" + location.host + "/ws");
+        
+        ws.onopen = () => document.getElementById("status").innerText = "Ready";
+        
+        ws.onmessage = async (event) => {
+            // Received Audio Chunk (Sentence)
+            const blob = event.data;
+            const url = URL.createObjectURL(blob);
+            
+            // Add to queue and try to play
+            audioQueue.push(url);
+            processQueue();
+        };
+        
+        ws.onclose = () => setTimeout(connectWS, 1000); // Auto Reconnect
+    }
+
+    // 2. Playback Logic (Streaming)
+    function processQueue() {
+        if (isPlaying || audioQueue.length === 0) return;
+        
+        isPlaying = true;
+        document.body.classList.add("speaking");
+        document.getElementById("status").innerText = "AI Speaking...";
+        
+        const url = audioQueue.shift();
+        currentAudio.src = url;
+        currentAudio.play();
+        
+        currentAudio.onended = () => {
+            isPlaying = false;
+            if (audioQueue.length > 0) {
+                processQueue(); // Play next sentence
+            } else {
+                document.body.classList.remove("speaking");
+                document.getElementById("status").innerText = "Ready";
+            }
+        };
+    }
+
+    // 3. Interaction Logic (Start/Stop)
+    function startTalking() {
+        if (isRecording) return;
+        isRecording = true;
+        
+        // INTERRUPT: Stop any playing audio immediately
+        currentAudio.pause();
+        currentAudio.currentTime = 0;
+        audioQueue = []; // Clear queue
+        isPlaying = false;
+        document.body.classList.remove("speaking");
+        
+        // Notify Server to stop generating
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ text: "INTERRUPT" }));
+
+        // Start Recording
+        chunks = [];
+        mediaRecorder.start();
+        
+        document.body.classList.add("recording");
+        document.getElementById("status").innerText = "Listening...";
+    }
+
+    function stopTalking() {
+        if (!isRecording) return;
+        isRecording = false;
+        
+        mediaRecorder.stop(); // Triggers sendAudio
+        
+        document.body.classList.remove("recording");
+        document.getElementById("status").innerText = "Thinking...";
+    }
+
+    function sendAudio() {
+        if (chunks.length > 0 && ws.readyState === WebSocket.OPEN) {
+            ws.send(new Blob(chunks, { type: 'audio/wav' }));
+        }
+        chunks = [];
+    }
+
+    // 4. Input Listeners
+    const btn = document.getElementById("mic-btn");
+    
+    // Mouse/Touch
+    btn.onmousedown = startTalking;
+    btn.onmouseup = stopTalking;
+    btn.onmouseleave = stopTalking;
+    btn.ontouchstart = (e) => { e.preventDefault(); startTalking(); };
+    btn.ontouchend = (e) => { e.preventDefault(); stopTalking(); };
+
+    // Keyboard (Spacebar)
+    document.onkeydown = (e) => {
+        if (e.code === "Space" && !e.repeat) startTalking();
+    };
+    document.onkeyup = (e) => {
+        if (e.code === "Space") stopTalking();
+    };
+
+    init();
+</script>
+</body>
+</html>
