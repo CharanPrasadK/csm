@@ -5,13 +5,17 @@ import torch
 import torchaudio
 import uvicorn
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from huggingface_hub import hf_hub_download, login
 from dotenv import load_dotenv
 
+import firebase_admin
+from firebase_admin import credentials, storage, db as firebase_db
+
+# Load environment variables from .env file
 load_dotenv()
 
 # Import from project files
@@ -34,6 +38,28 @@ PROMPT_TEXT = (
     "but like yeah I'm trying to like yeah I noticed this yesterday that like Mondays I "
     "sort of start the day with this not like a panic but like a"
 )
+
+# --- Firebase Initialization ---
+# Get credentials path and config from environment variables
+FIREBASE_CRED_PATH = os.getenv("FIREBASE_CRED_PATH", "serviceAccountKey.json")
+FIREBASE_DB_URL = os.getenv("FIREBASE_DB_URL")
+FIREBASE_BUCKET = os.getenv("FIREBASE_BUCKET")
+
+if not firebase_admin._apps:
+    try:
+        # Check if the credential file exists before initializing
+        if os.path.exists(FIREBASE_CRED_PATH):
+            cred = credentials.Certificate(FIREBASE_CRED_PATH)
+            firebase_admin.initialize_app(cred, {
+                'databaseURL': FIREBASE_DB_URL,
+                'storageBucket': FIREBASE_BUCKET
+            })
+            print(f"Firebase Admin Initialized with {FIREBASE_CRED_PATH}")
+        else:
+            print(f"Warning: Firebase credentials file not found at {FIREBASE_CRED_PATH}")
+    except Exception as e:
+        print(f"Warning: Firebase Init Failed: {e}")
+
 
 def fix_load_csm_1b(device: str = "cuda") -> Generator:
     print(f"Downloading config from {REPO_ID}...")
@@ -62,6 +88,7 @@ def fix_load_csm_1b(device: str = "cuda") -> Generator:
     model.to(device=device, dtype=torch.bfloat16)
     return Generator(model)
 
+
 def load_prompt_tensor(audio_path: str, target_sample_rate: int) -> torch.Tensor:
     audio_tensor, sample_rate = torchaudio.load(audio_path)
     audio_tensor = audio_tensor.squeeze(0)
@@ -69,6 +96,7 @@ def load_prompt_tensor(audio_path: str, target_sample_rate: int) -> torch.Tensor
         audio_tensor, orig_freq=sample_rate, new_freq=target_sample_rate
     )
     return audio_tensor
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -112,34 +140,88 @@ app.add_middleware(
 
 class TTSRequest(BaseModel):
     text: str
+    bookId: str  # Required to update Firebase
+
+
+def process_audio_task(text: str, book_id: str):
+    """
+    Background task to generate audio, upload it to Firebase Storage,
+    and update the book document in Realtime Database.
+    """
+    global model_generator, FIXED_CONTEXT, FIXED_SPEAKER_ID
+    
+    print(f"[BG Task] Starting audio generation for Book ID: {book_id}")
+    
+    if model_generator is None:
+        print("[BG Task] Error: Model not initialized.")
+        return
+
+    try:
+        # 1. Generate Audio
+        audio_tensor = model_generator.generate(
+            text=text,
+            speaker=FIXED_SPEAKER_ID,
+            context=FIXED_CONTEXT,
+            max_audio_length_ms=10000  # Cap length if needed
+        )
+        
+        # 2. Save to In-Memory Buffer
+        buffer = io.BytesIO()
+        torchaudio.save(buffer, audio_tensor.unsqueeze(0).cpu(), model_generator.sample_rate, format="wav")
+        buffer.seek(0)
+        
+        # 3. Upload to Firebase Storage
+        bucket = storage.bucket()
+        # Add a random suffix or timestamp if you want to avoid caching issues, 
+        # but overwriting by book_id is also fine for 1:1 mapping.
+        blob_path = f"book-narratives/{book_id}.wav"
+        blob = bucket.blob(blob_path)
+        
+        blob.upload_from_file(buffer, content_type="audio/wav")
+        blob.make_public()
+        
+        public_url = blob.public_url
+        
+        # 4. Update Realtime Database
+        # This update triggers the 'onValue' listener in the frontend
+        ref = firebase_db.reference(f'books/{book_id}')
+        ref.update({
+            'narrativeAudioUrl': public_url
+        })
+        
+        print(f"[BG Task] Success! Audio uploaded to: {public_url}")
+
+    except Exception as e:
+        print(f"[BG Task] FAILED: {e}")
+        # Optionally, write an error state to the DB so the UI knows it failed
+        # ref = firebase_db.reference(f'books/{book_id}')
+        # ref.update({'narrativeAudioUrl': 'error'})
+
 
 @app.post("/generate")
-async def generate_audio(request: TTSRequest):
-    global model_generator, FIXED_CONTEXT, FIXED_SPEAKER_ID
+async def generate_audio(request: TTSRequest, background_tasks: BackgroundTasks):
+    """
+    Endpoint receives text and bookId.
+    It returns immediately (202 Accepted) and processes audio in background.
+    """
     if model_generator is None:
         raise HTTPException(status_code=503, detail="Model not initialized.")
 
-    try:
-        print(f"Generating: '{request.text[:30]}...'")
-        audio_tensor = model_generator.generate(
-            text=request.text,
-            speaker=FIXED_SPEAKER_ID,
-            context=FIXED_CONTEXT,
-            max_audio_length_ms=10000
-        )
-        audio_tensor = audio_tensor.unsqueeze(0).cpu()
-        buffer = io.BytesIO()
-        torchaudio.save(buffer, audio_tensor, model_generator.sample_rate, format="wav")
-        buffer.seek(0)
-        return Response(content=buffer.read(), media_type="audio/wav")
+    # Fire and Forget: Add generation to background queue
+    background_tasks.add_task(process_audio_task, request.text, request.bookId)
+    
+    return JSONResponse(
+        content={
+            "status": "processing", 
+            "message": "Audio generation started in background",
+            "bookId": request.bookId
+        }, 
+        status_code=202
+    )
 
-    except Exception as e:
-        print(f"Generation Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    # Define Certificate Paths
-    # Note: These are the paths INSIDE the container (mapped from your host)
+    # Define Certificate Paths (mapped from host in deploy.sh)
     cert_path = "/etc/letsencrypt/live/csm-tts-bb.tribedemos.com/fullchain.pem"
     key_path = "/etc/letsencrypt/live/csm-tts-bb.tribedemos.com/privkey.pem"
 

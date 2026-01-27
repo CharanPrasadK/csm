@@ -11,3 +11,4 @@ silentcipher @ git+https://github.com/SesameAILabs/silentcipher@master
 fastapi
 uvicorn
 python-dotenv
+firebase-admin
