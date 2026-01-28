@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y \
 
 # Symlink python3 to python so 'python' command works
 RUN ln -s /usr/bin/python3 /usr/bin/python
+RUN pip install torch==2.4.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu124
 
 # Set working directory
 WORKDIR /app

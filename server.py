@@ -157,13 +157,26 @@ def process_audio_task(text: str, book_id: str):
         return
 
     try:
+        # --- DYNAMIC DURATION CALCULATION ---
+        word_count = len(text.split())
+        # Estimate: 2 words per second (generous) + 5 seconds buffer
+        estimated_ms = int((word_count / 2.0) * 1000) + 5000
+        
+        # Safety Clamps: Minimum 10s, Maximum 3 minutes (180s)
+        # This prevents it from cutting off "Hello" or running forever on garbage input
+        dynamic_max_length = max(10000, min(estimated_ms, 180000))
+        
+        print(f"[BG Task] Text length: {word_count} words. Setting max duration to: {dynamic_max_length}ms")
+
         # 1. Generate Audio
         audio_tensor = model_generator.generate(
             text=text,
             speaker=FIXED_SPEAKER_ID,
             context=FIXED_CONTEXT,
-            max_audio_length_ms=10000  # Cap length if needed
+            max_audio_length_ms=dynamic_max_length  # <--- Use the calculated value
         )
+        
+        # ... (rest of the function remains the same: saving, uploading, updating DB)
         
         # 2. Save to In-Memory Buffer
         buffer = io.BytesIO()
