@@ -4,6 +4,7 @@ import json
 import torch
 import torchaudio
 import uvicorn
+import time  # [!code ++] Added for timestamp generation
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import Response, JSONResponse
@@ -29,14 +30,15 @@ FIXED_SPEAKER_ID = 0
 
 # --- Configuration ---
 REPO_ID = "sesame/csm-1b"
-PROMPT_FILENAME = "prompts/conversational_a.wav"
+
+# [!code ++] CHANGED: Switched to "read_speech_a.wav" for better narration
+PROMPT_FILENAME = "prompts/read_speech_a.wav"
+
+# [!code ++] CHANGED: Exact transcript for read_speech_a.wav
 PROMPT_TEXT = (
-    "like revising for an exam I'd have to try and like keep up the momentum because I'd "
-    "start really early I'd be like okay I'm gonna start revising now and then like "
-    "you're revising for ages and then I just like start losing steam I didn't do that "
-    "for the exam we had recently to be fair that was a more of a last minute scenario "
-    "but like yeah I'm trying to like yeah I noticed this yesterday that like Mondays I "
-    "sort of start the day with this not like a panic but like a"
+    "And Lake turned round upon me, a little abruptly, his odd yellowish eyes, a little "
+    "like those of the sea eagle, and the ghost of his smile that flickered on his "
+    "singularly pale face, with a stern and insidious look, confronted me."
 )
 
 # --- Firebase Initialization ---
@@ -163,7 +165,6 @@ def process_audio_task(text: str, book_id: str):
         estimated_ms = int((word_count / 2.0) * 1000) + 5000
         
         # Safety Clamps: Minimum 10s, Maximum 3 minutes (180s)
-        # This prevents it from cutting off "Hello" or running forever on garbage input
         dynamic_max_length = max(10000, min(estimated_ms, 180000))
         
         print(f"[BG Task] Text length: {word_count} words. Setting max duration to: {dynamic_max_length}ms")
@@ -173,10 +174,8 @@ def process_audio_task(text: str, book_id: str):
             text=text,
             speaker=FIXED_SPEAKER_ID,
             context=FIXED_CONTEXT,
-            max_audio_length_ms=dynamic_max_length  # <--- Use the calculated value
+            max_audio_length_ms=dynamic_max_length
         )
-        
-        # ... (rest of the function remains the same: saving, uploading, updating DB)
         
         # 2. Save to In-Memory Buffer
         buffer = io.BytesIO()
@@ -185,30 +184,25 @@ def process_audio_task(text: str, book_id: str):
         
         # 3. Upload to Firebase Storage
         bucket = storage.bucket()
-        # Add a random suffix or timestamp if you want to avoid caching issues, 
-        # but overwriting by book_id is also fine for 1:1 mapping.
         blob_path = f"book-narratives/{book_id}.wav"
         blob = bucket.blob(blob_path)
         
         blob.upload_from_file(buffer, content_type="audio/wav")
         blob.make_public()
         
-        public_url = blob.public_url
+        # [!code ++] FIX: Add timestamp to URL to bust browser cache
+        final_url = f"{blob.public_url}?t={int(time.time())}"
         
         # 4. Update Realtime Database
-        # This update triggers the 'onValue' listener in the frontend
         ref = firebase_db.reference(f'books/{book_id}')
         ref.update({
-            'narrativeAudioUrl': public_url
+            'narrativeAudioUrl': final_url
         })
         
-        print(f"[BG Task] Success! Audio uploaded to: {public_url}")
+        print(f"[BG Task] Success! Audio uploaded to: {final_url}")
 
     except Exception as e:
         print(f"[BG Task] FAILED: {e}")
-        # Optionally, write an error state to the DB so the UI knows it failed
-        # ref = firebase_db.reference(f'books/{book_id}')
-        # ref.update({'narrativeAudioUrl': 'error'})
 
 
 @app.post("/generate")
@@ -217,6 +211,9 @@ async def generate_audio(request: TTSRequest, background_tasks: BackgroundTasks)
     Endpoint receives text and bookId.
     It returns immediately (202 Accepted) and processes audio in background.
     """
+    # [!code ++] ADDED: Debug print to see exact text from frontend
+    print(f"\n[API] Received Text for Book {request.bookId}:\n{request.text}\n")
+
     if model_generator is None:
         raise HTTPException(status_code=503, detail="Model not initialized.")
 
