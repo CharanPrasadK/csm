@@ -4,7 +4,8 @@ import json
 import torch
 import torchaudio
 import uvicorn
-import time  # [!code ++] Added for timestamp generation
+import time
+import threading # [!code ++] 1. Import threading
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import Response, JSONResponse
@@ -27,6 +28,9 @@ from generator import Generator, Segment
 model_generator = None
 FIXED_CONTEXT = []
 FIXED_SPEAKER_ID = 0
+
+# This acts as a "One at a time" gatekeeper for the GPU
+gpu_lock = threading.Lock()
 
 # --- Configuration ---
 REPO_ID = "sesame/csm-1b"
@@ -147,83 +151,87 @@ class TTSRequest(BaseModel):
 
 def process_audio_task(text: str, book_id: str):
     """
-    Background task to generate audio, upload it to Firebase Storage,
-    and update the book document in Realtime Database.
+    Background task to generate audio.
+    Now protected by a Lock to prevent parallel execution crashes.
     """
-    global model_generator, FIXED_CONTEXT, FIXED_SPEAKER_ID
+    global model_generator, FIXED_CONTEXT, FIXED_SPEAKER_ID, gpu_lock # [!code ++] Include gpu_lock
     
-    print(f"[BG Task] Starting audio generation for Book ID: {book_id}")
+    print(f"[BG Task] Queued audio generation for Book ID: {book_id}")
     
-    if model_generator is None:
-        print("[BG Task] Error: Model not initialized.")
-        return
+    # [!code ++] 3. Acquire the Lock
+    # If the GPU is busy, this line will PAUSE here and wait until it's free.
+    with gpu_lock:
+        print(f"[BG Task] 🔒 Lock Acquired. Generating for Book ID: {book_id}...")
+        
+        if model_generator is None:
+            print("[BG Task] Error: Model not initialized.")
+            return
 
-    try:
-        # --- DYNAMIC DURATION CALCULATION ---
-        word_count = len(text.split())
-        # Estimate: 2 words per second (generous) + 5 seconds buffer
-        estimated_ms = int((word_count / 2.0) * 1000) + 5000
-        
-        # Safety Clamps: Minimum 10s, Maximum 3 minutes (180s)
-        dynamic_max_length = max(10000, min(estimated_ms, 180000))
-        
-        print(f"[BG Task] Text length: {word_count} words. Setting max duration to: {dynamic_max_length}ms")
+        try:
+            # --- DYNAMIC DURATION CALCULATION ---
+            word_count = len(text.split())
+            estimated_ms = int((word_count / 2.0) * 1000) + 5000
+            dynamic_max_length = max(10000, min(estimated_ms, 180000))
+            
+            print(f"[BG Task] Processing... (Words: {word_count}, Max Duration: {dynamic_max_length}ms)")
 
-        # 1. Generate Audio
-        audio_tensor = model_generator.generate(
-            text=text,
-            speaker=FIXED_SPEAKER_ID,
-            context=FIXED_CONTEXT,
-            max_audio_length_ms=dynamic_max_length
-        )
-        
-        # 2. Save to In-Memory Buffer
-        buffer = io.BytesIO()
-        torchaudio.save(buffer, audio_tensor.unsqueeze(0).cpu(), model_generator.sample_rate, format="wav")
-        buffer.seek(0)
-        
-        # 3. Upload to Firebase Storage
-        bucket = storage.bucket()
-        blob_path = f"book-narratives/{book_id}.wav"
-        blob = bucket.blob(blob_path)
-        
-        blob.upload_from_file(buffer, content_type="audio/wav")
-        blob.make_public()
-        
-        # [!code ++] FIX: Add timestamp to URL to bust browser cache
-        final_url = f"{blob.public_url}?t={int(time.time())}"
-        
-        # 4. Update Realtime Database
-        ref = firebase_db.reference(f'books/{book_id}')
-        ref.update({
-            'narrativeAudioUrl': final_url
-        })
-        
-        print(f"[BG Task] Success! Audio uploaded to: {final_url}")
+            # 1. Generate Audio (CRITICAL SECTION)
+            # This is the heavy operation that must not be interrupted
+            audio_tensor = model_generator.generate(
+                text=text,
+                speaker=FIXED_SPEAKER_ID,
+                context=FIXED_CONTEXT,
+                max_audio_length_ms=dynamic_max_length
+            )
+            
+            # 2. Save to In-Memory Buffer
+            buffer = io.BytesIO()
+            torchaudio.save(buffer, audio_tensor.unsqueeze(0).cpu(), model_generator.sample_rate, format="wav")
+            buffer.seek(0)
+            
+            # 3. Upload to Firebase Storage
+            bucket = storage.bucket()
+            blob_path = f"book-narratives/{book_id}.wav"
+            blob = bucket.blob(blob_path)
+            
+            blob.upload_from_file(buffer, content_type="audio/wav")
+            blob.make_public()
+            
+            final_url = f"{blob.public_url}?t={int(time.time())}"
+            
+            # 4. Update Realtime Database
+            ref = firebase_db.reference(f'books/{book_id}')
+            ref.update({
+                'narrativeAudioUrl': final_url
+            })
+            
+            print(f"[BG Task] ✅ Success! Audio uploaded: {final_url}")
 
-    except Exception as e:
-        print(f"[BG Task] FAILED: {e}")
+        except Exception as e:
+            print(f"[BG Task] ❌ FAILED: {e}")
+            
+    # Lock is automatically released here
+    print(f"[BG Task] 🔓 Lock Released for Book ID: {book_id}")
 
 
 @app.post("/generate")
 async def generate_audio(request: TTSRequest, background_tasks: BackgroundTasks):
     """
     Endpoint receives text and bookId.
-    It returns immediately (202 Accepted) and processes audio in background.
+    Returns immediately. Tasks will queue up if the GPU is busy.
     """
-    # [!code ++] ADDED: Debug print to see exact text from frontend
-    print(f"\n[API] Received Text for Book {request.bookId}:\n{request.text}\n")
+    print(f"\n[API] Received Request for Book {request.bookId}")
 
     if model_generator is None:
         raise HTTPException(status_code=503, detail="Model not initialized.")
 
-    # Fire and Forget: Add generation to background queue
+    # Fire and Forget (But now thread-safe!)
     background_tasks.add_task(process_audio_task, request.text, request.bookId)
     
     return JSONResponse(
         content={
-            "status": "processing", 
-            "message": "Audio generation started in background",
+            "status": "queued", 
+            "message": "Audio generation added to queue",
             "bookId": request.bookId
         }, 
         status_code=202
