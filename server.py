@@ -36,7 +36,7 @@ gpu_lock = threading.Lock()
 REPO_ID = "sesame/csm-1b"
 
 # [!code ++] CHANGED: Switched to "read_speech_a.wav" for better narration
-PROMPT_FILENAME = "prompts/read_speech_a.wav"
+PROMPT_FILENAME = "read_speech_a.wav"
 
 # [!code ++] CHANGED: Exact transcript for read_speech_a.wav
 PROMPT_TEXT = (
@@ -121,15 +121,28 @@ async def lifespan(app: FastAPI):
     print(f"Initializing CSM Model on {device}...")
     model_generator = fix_load_csm_1b(device=device)
 
-    print("Loading voice prompt...")
+    print(f"Loading voice prompt: {PROMPT_FILENAME} ...")
     try:
-        path = hf_hub_download(repo_id=REPO_ID, filename=PROMPT_FILENAME)
+        # [!code ++] NEW LOGIC: Check for local file first
+        if os.path.exists(PROMPT_FILENAME):
+            print(f"✅ Found local custom file: {PROMPT_FILENAME}")
+            path = PROMPT_FILENAME
+        else:
+            print(f"⬇️ Local file not found. Attempting download from Hugging Face...")
+            path = hf_hub_download(repo_id=REPO_ID, filename='prompts/read_speech_a.wav')
+
+        # Load the audio
         audio_tensor = load_prompt_tensor(path, model_generator.sample_rate)
+        
+        # Create the context segment
         segment = Segment(text=PROMPT_TEXT, speaker=FIXED_SPEAKER_ID, audio=audio_tensor)
         FIXED_CONTEXT = [segment]
-        print("Voice context loaded.")
+        print("Voice context loaded successfully.")
+        
     except Exception as e:
-        print(f"Error loading voice prompt: {e}")
+        print(f"❌ Error loading voice prompt: {e}")
+        # Consider raising an error here if the prompt is critical
+        # raise e 
 
     yield
 
